@@ -39,10 +39,12 @@ def get_secret(name: str) -> str:
     return val
 
 
-# Placeholder for the initial EUR_TO_NOK (will be fetched dynamically)
-EUR_TO_NOK = 11.5  # Fallback value if API fails
-NORGESPRIS_CAP_EUR_PER_MWH = 400.0 / EUR_TO_NOK  # ~34.78 EUR/MWh to get 40 øre/kWh
-SUPPORT_THRESHOLD_NOK_PER_KWH = 0.77
+# Fallback EUR/NOK rate – only used when Norges Bank API is unavailable
+EUR_TO_NOK_FALLBACK = 11.5
+
+# Norgespris cap: 40 øre/kWh = 0.40 NOK/kWh (fixed by regulation, no FX conversion)
+NORGESPRIS_CAP_NOK_PER_KWH = 0.40
+SUPPORT_THRESHOLD_NOK_PER_KWH = 0.77  # 77 øre/kWh
 SUPPORT_RATE = 0.90
 VAT_RATE = 0.25  # 25% MVA
 
@@ -124,11 +126,11 @@ def fetch_eur_nok_rates(start_str: str, end_str: str) -> pd.DataFrame:
     
     except Exception as e:
         print(f"Warning: Failed to fetch EUR/NOK rates from Norges Bank: {e}")
-    print("Falling back to constant EUR_TO_NOK rate for missing dates.")
+    print("Falling back to constant EUR_TO_NOK_FALLBACK rate for missing dates.")
     # Fallback: fill in all dates with constant rate
     current_date = start_date
     while current_date <= end_date:
-        rows.append({"date": current_date, "eur_to_nok": EUR_TO_NOK})
+        rows.append({"date": current_date, "eur_to_nok": EUR_TO_NOK_FALLBACK})
         current_date += pd.Timedelta(days=1)
     
     return pd.DataFrame(rows)
@@ -482,7 +484,7 @@ def build_cost_proxy(inputs: Inputs) -> pd.DataFrame:
     df["share_np"] = df["share_np"].fillna(0.0)
     df["norgespris_count"] = df["norgespris_count"].fillna(0)
     df["total_count"] = df["total_count"].fillna(0)
-    df["eur_to_nok"] = df["eur_to_nok"].fillna(EUR_TO_NOK)  # Fallback to constant if merge fails
+    df["eur_to_nok"] = df["eur_to_nok"].fillna(EUR_TO_NOK_FALLBACK)  # Fallback if merge fails
 
     # Convert spot price to NOK/kWh using daily exchange rates
     df["spot_nok_kwh"] = eur_mwh_to_nok_kwh(df["spot_eur_mwh"], df["eur_to_nok"])
@@ -492,9 +494,8 @@ def build_cost_proxy(inputs: Inputs) -> pd.DataFrame:
     df["vol_rest_kwh"] = df["volume_kwh"] * (1.0 - df["share_np"])
 
     # 6) Prisregler
-    # Norgespris: capped at 40 øre/kWg 
-    norgespris_cap_nok_per_kwh = (NORGESPRIS_CAP_EUR_PER_MWH / 1000.0) * df["eur_to_nok"]
-    df["price_np_nok_kwh"] = df["spot_nok_kwh"].clip(upper=norgespris_cap_nok_per_kwh)
+    # Norgespris: capped at 40 øre/kWh (fixed NOK cap, no FX conversion needed)
+    df["price_np_nok_kwh"] = df["spot_nok_kwh"].clip(upper=NORGESPRIS_CAP_NOK_PER_KWH)
 
     # Strømstøtte: 90% over 77 øre/kWh - ONLY for household consumption group
     df["support_nok_kwh"] = SUPPORT_RATE * (df["spot_nok_kwh"] - SUPPORT_THRESHOLD_NOK_PER_KWH).clip(lower=0.0)
@@ -511,13 +512,13 @@ def build_cost_proxy(inputs: Inputs) -> pd.DataFrame:
     # 8) State cost calculations (Norgespris is SYMMETRICAL)
     # Norgespris gain/loss: difference between spot and cap (can be negative = gain for state)
     # (spot - cap) * volume: positive = loss for state, negative = gain for state
-    df["np_gain_loss_nok"] = df["vol_np_kwh"] * (df["spot_nok_kwh"] - norgespris_cap_nok_per_kwh)
+    df["np_gain_loss_nok"] = df["vol_np_kwh"] * (df["spot_nok_kwh"] - NORGESPRIS_CAP_NOK_PER_KWH)
 
     # VAT loss on Norgespris: when spot > cap, state loses VAT on the difference
     # Lost VAT = (spot - cap) * volume * VAT_RATE (only when spot > cap)
     df["np_vat_loss_nok"] = (
         df["vol_np_kwh"] *
-        (df["spot_nok_kwh"] - norgespris_cap_nok_per_kwh).clip(lower=0.0) *
+        (df["spot_nok_kwh"] - NORGESPRIS_CAP_NOK_PER_KWH).clip(lower=0.0) *
         VAT_RATE
     )
 
