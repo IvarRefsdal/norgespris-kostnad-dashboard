@@ -214,9 +214,9 @@ def _fetch_consumption_chunk_hist(start_iso: str, end_iso: str, pa: str, cons_gr
     return _fetch_consumption_chunk_raw(start_iso, end_iso, pa, cons_group)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600 * 4, show_spinner=False)
 def _fetch_consumption_chunk_current(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Current-month chunk — 1-hour TTL (data still updating)."""
+    """Current-month chunk — 4-hour TTL (data still updating)."""
     return _fetch_consumption_chunk_raw(start_iso, end_iso, pa, cons_group)
 
 
@@ -277,9 +277,9 @@ def _fetch_norgespris_chunk_hist(start_iso: str, end_iso: str, pa: str, cons_gro
     return _fetch_norgespris_chunk_raw(start_iso, end_iso, pa, cons_group)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600 * 4, show_spinner=False)
 def _fetch_norgespris_chunk_current(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Current-month chunk — 1-hour TTL."""
+    """Current-month chunk — 4-hour TTL."""
     return _fetch_norgespris_chunk_raw(start_iso, end_iso, pa, cons_group)
 
 
@@ -384,9 +384,9 @@ def _fetch_spot_chunk_hist(start_iso: str, end_iso: str, pa: str) -> list[dict]:
     return _fetch_spot_chunk_raw(start_iso, end_iso, pa)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600 * 4, show_spinner=False)
 def _fetch_spot_chunk_current(start_iso: str, end_iso: str, pa: str) -> list[dict]:
-    """Current-month chunk — 1-hour TTL."""
+    """Current-month chunk — 4-hour TTL."""
     return _fetch_spot_chunk_raw(start_iso, end_iso, pa)
 
 

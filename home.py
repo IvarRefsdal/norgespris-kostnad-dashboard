@@ -124,20 +124,30 @@ if "df" in st.session_state:
     with tab2:
         st.subheader("Kumulativ kostnad for staten")
         st.caption(f"Budsjett: 11 mrd NOK")
+        st.info("⚠️ Budsjettet er uten MVA. Linjen «Uten MVA» er sammenlignbar med budsjettet.")
 
-        # Create cumulative chart with budget line
-        cum_data = daily[["date", "cumulative_cost_nok"]].copy()
+        # Create cumulative cost without MVA (excluding np_vat_loss and support_vat_loss)
+        daily["cost_ex_mva"] = daily["np_gain_loss_nok"] + daily["support_nok"]
+        daily["cumulative_cost_ex_mva_nok"] = daily["cost_ex_mva"].cumsum()
+
+        # Create cumulative chart with budget line and both cost lines
+        cum_data = daily[["date", "cumulative_cost_nok", "cumulative_cost_ex_mva_nok"]].copy()
         cum_data["Budsjett (11 mrd)"] = BUDGET_NOK
         cum_data = cum_data.set_index("date")
-        cum_data = cum_data.rename(columns={"cumulative_cost_nok": "Kumulativ kostnad"})
+        cum_data = cum_data.rename(columns={
+            "cumulative_cost_nok": "Med MVA",
+            "cumulative_cost_ex_mva_nok": "Uten MVA",
+        })
 
         st.line_chart(cum_data)
 
-        # Show how much of budget is used
+        # Show how much of budget is used (compare without MVA to budget)
         total_cost = daily["cumulative_cost_nok"].iloc[-1] if len(daily) > 0 else 0
-        budget_pct = (total_cost / BUDGET_NOK) * 100
+        total_cost_ex_mva = daily["cumulative_cost_ex_mva_nok"].iloc[-1] if len(daily) > 0 else 0
+        budget_pct = (total_cost_ex_mva / BUDGET_NOK) * 100
         st.progress(min(budget_pct / 100, 1.0))
-        st.write(f"**{budget_pct:.1f}%** av budsjett brukt ({total_cost / 1e9:.2f} av 11 mrd NOK)")
+        st.write(f"**{budget_pct:.1f}%** av budsjett brukt uten MVA ({total_cost_ex_mva / 1e9:.2f} av 11 mrd NOK)")
+        st.write(f"Med MVA: {total_cost / 1e9:.2f} mrd NOK")
 
     with tab3:
         st.subheader("Andel med Norgespris")
