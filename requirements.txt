@@ -1,0 +1,5 @@
+streamlit
+pandas
+requests
+entsoe-py>=0.7.10
+python-dotenv>=0.9.9
