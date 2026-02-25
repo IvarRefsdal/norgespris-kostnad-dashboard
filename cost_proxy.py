@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 from entsoe import EntsoePandasClient
 
-import os
 import streamlit as st
 
 # Optional: local dev only
@@ -17,6 +17,13 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
+    pass
+
+
+class DataFetchError(Exception):
+    """Raised when a critical data fetch returns no results.
+    Because the exception is raised *inside* @st.cache_data functions,
+    Streamlit will NOT cache the (empty) result, so the next call retries."""
     pass
 
 
@@ -153,39 +160,31 @@ def _get_entsoe_client() -> EntsoePandasClient:
     return EntsoePandasClient(api_key=api_key)
 
 
-# -----------------------------
-# Helpers: chunking and cache tiering
-# -----------------------------
-def _calendar_month_chunks(start: pd.Timestamp, end: pd.Timestamp):
-    """Yield (chunk_start, chunk_end) pairs aligned to calendar month boundaries.
-
-    Calendar alignment ensures that shared months (e.g. Dec, Jan, Feb)
-    produce identical cache keys regardless of whether the overall query
-    starts in October or December.
-    """
-    current = start
-    while current < end:
-        next_month = current.replace(day=1) + pd.DateOffset(months=1)
-        if current.tz is not None and next_month.tz is None:
-            next_month = next_month.tz_localize(current.tz)
-        chunk_end = min(next_month, end)
-        yield current, chunk_end
-        current = chunk_end
 
 
-def _chunk_is_historical(chunk_start: pd.Timestamp) -> bool:
-    """True if chunk covers a completed calendar month (not the current one).
+def _calendar_month_ranges(start_date: date, end_date: date) -> list[tuple[str, str]]:
+    """Split a date range into calendar-month sub-ranges (ISO strings).
+    Elhub API rejects requests spanning more than ~1 month."""
+    ranges = []
+    current = start_date
+    while current <= end_date:
+        # First day of next month
+        if current.month == 12:
+            next_month_first = date(current.year + 1, 1, 1)
+        else:
+            next_month_first = date(current.year, current.month + 1, 1)
+        # Last day of current month
+        month_end = next_month_first - timedelta(days=1)
+        chunk_end = min(month_end, end_date)
+        ranges.append((current.isoformat(), chunk_end.isoformat()))
+        current = chunk_end + timedelta(days=1)
+    return ranges
 
-    Historical chunks get a longer cache TTL since their data won't change.
-    """
-    now = pd.Timestamp.now(tz="Europe/Oslo")
-    return (chunk_start.year, chunk_start.month) < (now.year, now.month)
 
+# --- Elhub Consumption ---
 
-# --- Per-chunk cached fetchers: Elhub Consumption ---
-
-def _fetch_consumption_chunk_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Raw Elhub API call for one consumption chunk (uncached)."""
+def _fetch_consumption_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
+    """Raw Elhub API call for one consumption request."""
     params = {
         "dataset": "CONSUMPTION_PER_GROUP_MBA_HOUR",
         "startDate": start_iso,
@@ -208,29 +207,36 @@ def _fetch_consumption_chunk_raw(start_iso: str, end_iso: str, pa: str, cons_gro
     return rows
 
 
-@st.cache_data(ttl=3600 * 24 * 7, show_spinner=False)
-def _fetch_consumption_chunk_hist(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Historical chunk — 7-day TTL (data is final)."""
-    return _fetch_consumption_chunk_raw(start_iso, end_iso, pa, cons_group)
-
-
 @st.cache_data(ttl=3600 * 4, show_spinner=False)
-def _fetch_consumption_chunk_current(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Current-month chunk — 4-hour TTL (data still updating)."""
-    return _fetch_consumption_chunk_raw(start_iso, end_iso, pa, cons_group)
+def fetch_elhub_consumption(start_str: str, end_str: str) -> pd.DataFrame:
+    """Fetch hourly household + cabin consumption for the full period.
+    Cached by start/end strings so Oct-today and Dec-today each get their own entry.
+    Splits into monthly sub-requests (Elhub API limit) but parallelizes across zones/groups."""
+    start = pd.Timestamp(start_str, tz="Europe/Oslo")
+    end = pd.Timestamp(end_str, tz="Europe/Oslo")
+    month_ranges = _calendar_month_ranges(start.date(), end.date())
 
-
-def fetch_elhub_consumption(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Fetch hourly household + cabin consumption via calendar-month cached chunks."""
     rows: list[dict] = []
-    for chunk_start, chunk_end in _calendar_month_chunks(start, end):
-        fetch = _fetch_consumption_chunk_hist if _chunk_is_historical(chunk_start) else _fetch_consumption_chunk_current
-        cs, ce = str(chunk_start.date()), str(chunk_end.date())
-        for pa in PRICE_AREAS:
-            for cons_group in CONSUMPTION_GROUPS:
-                rows.extend(fetch(cs, ce, pa, cons_group))
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for cs, ce in month_ranges:
+            for pa in PRICE_AREAS:
+                for cons_group in CONSUMPTION_GROUPS:
+                    future = executor.submit(_fetch_consumption_raw, cs, ce, pa, cons_group)
+                    futures.append(future)
+
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception as e:
+                print(f"Warning: Failed to fetch consumption data: {e}")
+                continue
+
     if not rows:
-        return pd.DataFrame(columns=["start_time", "price_area", "cons_group", "volume_kwh"])
+        raise DataFetchError(
+            "Kunne ikke hente forbruksdata fra Elhub. "
+            "Vennligst prøv igjen senere."
+        )
     df = pd.DataFrame(rows)
     df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
     return df
@@ -242,8 +248,8 @@ def fetch_elhub_consumption(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFr
 # hit the SAME Elhub endpoint (NORGESPRIS_CONSUMPTION_PER_GROUP_EAC_MBA).
 # A single cached fetcher eliminates duplicate API calls.
 
-def _fetch_norgespris_chunk_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Raw Elhub API call for one norgespris chunk (uncached).
+def _fetch_norgespris_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
+    """Raw Elhub API call for norgespris data.
     Returns all fields so both count and comparison views can derive from it."""
     params = {
         "dataset": "NORGESPRIS_CONSUMPTION_PER_GROUP_EAC_MBA",
@@ -271,37 +277,37 @@ def _fetch_norgespris_chunk_raw(start_iso: str, end_iso: str, pa: str, cons_grou
     return rows
 
 
-@st.cache_data(ttl=3600 * 24 * 7, show_spinner=False)
-def _fetch_norgespris_chunk_hist(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Historical chunk — 7-day TTL."""
-    return _fetch_norgespris_chunk_raw(start_iso, end_iso, pa, cons_group)
-
-
 @st.cache_data(ttl=3600 * 4, show_spinner=False)
-def _fetch_norgespris_chunk_current(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
-    """Current-month chunk — 4-hour TTL."""
-    return _fetch_norgespris_chunk_raw(start_iso, end_iso, pa, cons_group)
-
-
-def _fetch_norgespris_unified(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Fetch and cache norgespris data using calendar-month chunks.
+def _fetch_norgespris_unified(start_str: str, end_str: str) -> pd.DataFrame:
+    """Fetch norgespris data for the full period.
+    Cached by start/end strings so Oct-today and Dec-today each get their own entry.
+    Splits into monthly sub-requests (Elhub API limit) but parallelizes across zones/groups.
     Returns all fields needed by both norgespris counts and consumption comparison."""
+    start = pd.Timestamp(start_str, tz="Europe/Oslo")
+    end = pd.Timestamp(end_str, tz="Europe/Oslo")
+    month_ranges = _calendar_month_ranges(start.date(), end.date())
+
     rows: list[dict] = []
-    for chunk_start, chunk_end in _calendar_month_chunks(start, end):
-        fetch = _fetch_norgespris_chunk_hist if _chunk_is_historical(chunk_start) else _fetch_norgespris_chunk_current
-        cs, ce = str(chunk_start.date()), str(chunk_end.date())
-        for pa in PRICE_AREAS:
-            for cons_group in CONSUMPTION_GROUPS:
-                try:
-                    rows.extend(fetch(cs, ce, pa, cons_group))
-                except Exception as e:
-                    print(f"Warning: Failed to fetch norgespris data for {pa}/{cons_group}: {e}")
-                    continue
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = []
+        for cs, ce in month_ranges:
+            for pa in PRICE_AREAS:
+                for cons_group in CONSUMPTION_GROUPS:
+                    future = executor.submit(_fetch_norgespris_raw, cs, ce, pa, cons_group)
+                    futures.append(future)
+
+        for future in as_completed(futures):
+            try:
+                rows.extend(future.result())
+            except Exception as e:
+                print(f"Warning: Failed to fetch norgespris data: {e}")
+                continue
+
     if not rows:
-        return pd.DataFrame(columns=[
-            "date", "price_area", "cons_group", "norgespris_count", "total_count",
-            "forbruk_np", "forbruk_total"
-        ])
+        raise DataFetchError(
+            "Kunne ikke hente Norgespris-data fra Elhub. "
+            "Vennligst prøv igjen senere."
+        )
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["start_time"], utc=True).dt.date
     df = df.drop(columns=["start_time"])
@@ -318,7 +324,7 @@ def _fetch_norgespris_unified(start: pd.Timestamp, end: pd.Timestamp) -> pd.Data
 def fetch_elhub_norgespris_consumption_comparison(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Derive consumption comparison from unified cached norgespris data.
     Eliminates duplicate API calls — shares cache with fetch_elhub_norgespris."""
-    df = _fetch_norgespris_unified(start, end)
+    df = _fetch_norgespris_unified(str(start), str(end))
     if df.empty:
         return pd.DataFrame(columns=["date", "price_area", "cons_group", "forbruk_total", "forbruk_np",
                                       "antall_total", "antall_np", "share_consumption", "share_count",
@@ -337,7 +343,7 @@ def fetch_elhub_norgespris_consumption_comparison(start: pd.Timestamp, end: pd.T
 def fetch_elhub_norgespris(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
     """Derive norgespris share from unified cached norgespris data.
     Eliminates duplicate API calls — shares cache with fetch_elhub_norgespris_consumption_comparison."""
-    df = _fetch_norgespris_unified(start, end)
+    df = _fetch_norgespris_unified(str(start), str(end))
     if df.empty:
         return pd.DataFrame(columns=["date", "price_area", "cons_group", "norgespris_count", "total_count", "share_np"])
     result = df[["date", "price_area", "cons_group", "norgespris_count", "total_count"]].copy()
@@ -347,10 +353,10 @@ def fetch_elhub_norgespris(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFra
     return result
 
 
-# --- Per-chunk cached fetchers: ENTSO-E Spot Prices ---
+# --- ENTSO-E Spot Prices ---
 
-def _fetch_spot_chunk_raw(start_iso: str, end_iso: str, pa: str) -> list[dict]:
-    """Raw ENTSO-E spot price fetch for one price area and one month chunk (uncached)."""
+def _fetch_spot_raw(start_iso: str, end_iso: str, pa: str) -> list[dict]:
+    """Raw ENTSO-E spot price fetch for one price area (uncached)."""
     client = _get_entsoe_client()
     zone_code = ENTSOE_ZONE_MAP[pa]
     start = pd.Timestamp(start_iso)
@@ -378,35 +384,29 @@ def _fetch_spot_chunk_raw(start_iso: str, end_iso: str, pa: str) -> list[dict]:
     return rows
 
 
-@st.cache_data(ttl=3600 * 24 * 7, show_spinner=False)
-def _fetch_spot_chunk_hist(start_iso: str, end_iso: str, pa: str) -> list[dict]:
-    """Historical chunk — 7-day TTL."""
-    return _fetch_spot_chunk_raw(start_iso, end_iso, pa)
-
-
 @st.cache_data(ttl=3600 * 4, show_spinner=False)
-def _fetch_spot_chunk_current(start_iso: str, end_iso: str, pa: str) -> list[dict]:
-    """Current-month chunk — 4-hour TTL."""
-    return _fetch_spot_chunk_raw(start_iso, end_iso, pa)
-
-
-def fetch_spot_prices(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Fetch day-ahead spot prices via calendar-month cached chunks."""
-    # Ensure timezone awareness
-    if start.tz is None:
-        start = start.tz_localize("Europe/Oslo")
-    if end.tz is None:
-        end = end.tz_localize("Europe/Oslo")
+def fetch_spot_prices(start_str: str, end_str: str) -> pd.DataFrame:
+    """Fetch day-ahead spot prices for the full period.
+    Cached by start/end strings so Oct-today and Dec-today each get their own entry.
+    Fetches sequentially (one zone at a time) to avoid overwhelming ENTSO-E API."""
+    start = pd.Timestamp(start_str, tz="Europe/Oslo")
+    end = pd.Timestamp(end_str, tz="Europe/Oslo")
+    start_iso, end_iso = str(start.date()), str(end.date())
 
     rows: list[dict] = []
-    for chunk_start, chunk_end in _calendar_month_chunks(start, end):
-        fetch = _fetch_spot_chunk_hist if _chunk_is_historical(chunk_start) else _fetch_spot_chunk_current
-        cs, ce = str(chunk_start.date()), str(chunk_end.date())
-        for pa in PRICE_AREAS:
-            rows.extend(fetch(cs, ce, pa))
+    # Fetch sequentially (one zone at a time) to avoid 503 errors
+    for pa in PRICE_AREAS:
+        try:
+            rows.extend(_fetch_spot_raw(start_iso, end_iso, pa))
+        except Exception as e:
+            print(f"Warning: Failed to fetch spot price data for {pa}: {e}")
+            continue
 
     if not rows:
-        return pd.DataFrame(columns=["start_time", "price_area", "spot_eur_mwh"])
+        raise DataFetchError(
+            "Kunne ikke hente spotprisdata fra ENTSO-E. "
+            "Vennligst prøv igjen senere."
+        )
 
     df = pd.DataFrame(rows)
     df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
@@ -439,7 +439,7 @@ def build_cost_proxy(inputs: Inputs) -> pd.DataFrame:
     fx_rates = fetch_eur_nok_rates(str(inputs.start), str(inputs.end))
     
     # 1) Elhub: forbruk per time (via Energy Data API) - household + cabin
-    cons = fetch_elhub_consumption(inputs.start, inputs.end)
+    cons = fetch_elhub_consumption(str(inputs.start), str(inputs.end))
     if cons.empty:
         return pd.DataFrame(columns=[
             "start_time", "price_area", "cons_group", "volume_kwh", "date", "spot_eur_mwh", "eur_to_nok", "spot_nok_kwh",
@@ -468,7 +468,7 @@ def build_cost_proxy(inputs: Inputs) -> pd.DataFrame:
     np_cnt = fetch_elhub_norgespris(inputs.start, inputs.end)
 
     # 3) Spotpriser per område
-    spot = fetch_spot_prices(inputs.start, inputs.end)
+    spot = fetch_spot_prices(str(inputs.start), str(inputs.end))
 
     # 4) Slå sammen: timeforbruk + spot + norgespris-andel (per dag/cons_group)
     cons["date"] = cons["start_time"].dt.date

@@ -2,25 +2,24 @@
 import streamlit as st
 import pandas as pd
 
-from cost_proxy import Inputs, build_cost_proxy, PRICE_AREAS, fetch_elhub_norgespris_consumption_comparison
+from cost_proxy import Inputs, build_cost_proxy, PRICE_AREAS, fetch_elhub_norgespris_consumption_comparison, DataFetchError
 
 st.set_page_config(page_title="Norgespris og Strømstøtte proxy kostnad ",
                    layout="wide")
 st.title("Norgespris og Strømstøtte proxy kostnad ")
 
 
-# No top-level @st.cache_data needed — granular per-chunk caching
-# is now handled inside cost_proxy.py with calendar-month-aligned keys
-# and tiered TTLs (7 days for historical months, 1 hour for current).
+@st.cache_data(ttl=3600 * 4, show_spinner=False)
 def fetch_data(start_str: str, end_str: str) -> pd.DataFrame:
-    """Thin wrapper — caching is handled at the chunk level inside cost_proxy."""
+    """Cached by start/end strings — Oct-today and Dec-today each get their own cache entry."""
     start = pd.Timestamp(start_str, tz="Europe/Oslo")
     end = pd.Timestamp(end_str, tz="Europe/Oslo")
     return build_cost_proxy(Inputs(start=start, end=end))
 
 
+@st.cache_data(ttl=3600 * 4, show_spinner=False)
 def fetch_consumption_comparison(start_str: str, end_str: str) -> pd.DataFrame:
-    """Thin wrapper — caching is handled at the chunk level inside cost_proxy."""
+    """Cached by start/end strings — Oct-today and Dec-today each get their own cache entry."""
     start = pd.Timestamp(start_str, tz="Europe/Oslo")
     end = pd.Timestamp(end_str, tz="Europe/Oslo")
     return fetch_elhub_norgespris_consumption_comparison(start, end)
@@ -44,8 +43,12 @@ if st.sidebar.button("Last data", type="primary"):
     end_str = pd.Timestamp.now(tz="Europe/Oslo").date().isoformat() + " 23:00:00"
 
     with st.spinner("loading data from Elhub and Entsoe"):
-        df = fetch_data(start_str, end_str)
-        consumption_comp = fetch_consumption_comparison(start_str, end_str)
+        try:
+            df = fetch_data(start_str, end_str)
+            consumption_comp = fetch_consumption_comparison(start_str, end_str)
+        except DataFetchError as e:
+            st.error(f"⚠️ {e}")
+            st.stop()
 
     if df.empty:
         st.warning("Ingen data returnert. Sjekk entsoe-tilkobling.")
