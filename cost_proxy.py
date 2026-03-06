@@ -251,10 +251,13 @@ def fetch_elhub_consumption(start_str: str, end_str: str) -> pd.DataFrame:
 def _fetch_norgespris_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
     """Raw Elhub API call for norgespris data.
     Returns all fields so both count and comparison views can derive from it."""
+    # Elhub treats endDate as exclusive for this dataset,
+    # so extend by 1 day to include the last day of the chunk.
+    end_inclusive = (date.fromisoformat(end_iso) + timedelta(days=1)).isoformat()
     params = {
         "dataset": "NORGESPRIS_CONSUMPTION_PER_GROUP_EAC_MBA",
         "startDate": start_iso,
-        "endDate": end_iso,
+        "endDate": end_inclusive,
         "consumptionGroup": cons_group,
         "granularity": "DAILY",
     }
