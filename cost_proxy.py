@@ -185,10 +185,12 @@ def _calendar_month_ranges(start_date: date, end_date: date) -> list[tuple[str, 
 
 def _fetch_consumption_raw(start_iso: str, end_iso: str, pa: str, cons_group: str) -> list[dict]:
     """Raw Elhub API call for one consumption request."""
+    # Elhub treats endDate as exclusive, so extend by 1 day to include the last day of the chunk.
+    end_inclusive = (date.fromisoformat(end_iso) + timedelta(days=1)).isoformat()
     params = {
         "dataset": "CONSUMPTION_PER_GROUP_MBA_HOUR",
         "startDate": start_iso,
-        "endDate": end_iso,
+        "endDate": end_inclusive,
         "consumptionGroup": cons_group,
     }
     url = f"{ELHUB_API_BASE}/price-areas/{pa}?{urlencode(params)}"
